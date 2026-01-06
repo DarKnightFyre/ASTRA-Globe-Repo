@@ -1,0 +1,12 @@
+﻿Designator,Footprint,Quantity,Value,LCSC Part #
+"220OHMS1, 220OHMS2",R0805,2,R,C2907238
+A1,RaspberryPi_Pico_Common_Unspecified,1,RaspberryPi_Pico_W,
+"D1, D2",LED_D5.0mm,2,LED,
+D3,DIOAD1039W78L463D236,1,1N5817-T,C2935162
+J1,PinHeader_1x04_P1.00mm_Vertical,1,Encoders,C124378
+"J11, J12, J13, J14, J5, J6, J7, J8",PinHeader_1x02_P1.00mm_Vertical,8,Conn_01x02,C492401
+J2,PinHeader_1x04_P1.00mm_Vertical,1,Motor1,C124378
+J3,PinHeader_1x04_P1.00mm_Vertical,1,Motor2,C124378
+J4,PinHeader_1x04_P1.00mm_Vertical,1,Motor3,C124378
+"SW1, SW2, SW3, SW4, SW5, SW6",SW_PUSH_6mm,6,SW_Push,
+SW7,SW_PUSH_6mm,1,The rascal one,
