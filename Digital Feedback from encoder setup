@@ -1,0 +1,611 @@
+"""
+Astra Globe boot & setup sequence for Raspberry Pi Pico W in MicroPython.
+
+- Controls two ULN2003-driven steppers (stepper1 = tilt, stepper2 = rotation/hour-of-day)
+- Reads two AS5600 magnetic encoders (I2C)
+- Handles 7 pushbuttons and two LEDs
+- This should be the code to make the ASTRA Globe
+
+Pin mapping 
+- Buttons:
+    Button 1 -> GP0   (DST toggle in normal mode)
+    Button 2 -> GP1   (mode / confirm)
+    Button 3 -> GP3   (month increment / coarse adjust)
+    Button 4 -> GP4   (day adjust / time-of-day coarse)
+    Button 5 -> GP5   (hour adjust / time-of-day medium)
+    Button 6 -> GP6   (5-minute adjust / time-of-day fine)
+    Button 7 -> GP7   (home stepper 1)
+- LEDs:
+    LED1 -> GP8
+    LED2 -> GP9
+- AS5600 encoders:
+    Encoder 1 SDA/SCL -> GP10 (SDA), GP11 (SCL)   (I2C(0))
+    Encoder 2 SDA/SCL -> GP12 (SDA), GP13 (SCL)   (I2C(1))
+- Stepper 1 (ULN2003 #1): GP20(IN1), GP19(IN2), GP18(IN3), GP17(IN4)
+- Stepper 2 (ULN2003 #2): GP27(IN1), GP26(IN2), GP22(IN3), GP21(IN4)
+
+Adjust constants below to match your hardware.
+"""
+
+from machine import Pin, I2C
+import time
+import math
+
+# ===== CONFIG =====
+# Steps per revolution for your stepper (half-step mode). Adjust to your motor (e.g., 4096 for 28BYJ-48).
+STEPS_PER_REV_TILT = 4096
+STEPS_PER_REV_ROT  = 4096
+
+# step delay (ms) for different speeds
+STEP_DELAY_SLOW = 10    # slow continuous spin (ms)
+STEP_DELAY_MED  = 6     # medium speed
+STEP_DELAY_FAST = 3     # fast stepping for adjustments
+
+# AS5600
+AS5600_ADDR = 0x36
+
+# Tilt limits (degrees)
+TILT_MAX = 23.4
+TILT_SAFE_LIMIT = 23.6
+
+# Target tilt to define home after pressing Button 7
+TARGET_HOME_TILT = 24.0  # spec said 24 degrees; code will try to move ~24 deg from press position to set home
+
+# Button debounce (ms)
+DEBOUNCE_MS = 50
+
+# LED blink rates (ms)
+LED_BLINK_SLOW = 800
+LED_BLINK_FAST = 250
+
+# ===== PIN SETUP =====
+# Buttons mapping (GPIO numbers)
+BTN_PINS = {
+    1: 0,   # DST toggle
+    2: 1,   # mode / confirm
+    3: 3,   # month / coarse adj
+    4: 4,   # day / time coarse
+    5: 5,   # hour / time medium
+    6: 6,   # 5-min / time fine
+    7: 7,   # home stepper 1
+}
+
+# LEDs
+LED1_PIN = 8
+LED2_PIN = 9
+
+# Stepper pins (IN1..IN4 order)
+STEPPER1_PINS = (20, 19, 18, 17)  # tilt
+STEPPER2_PINS = (27, 26, 22, 21)  # rotation (time-of-day)
+
+# AS5600 I2C busses
+I2C1_SDA = 10
+I2C1_SCL = 11
+I2C2_SDA = 12
+I2C2_SCL = 13
+
+# ===== UTIL =====
+def clamp(v, a, b):
+    return max(a, min(b, v))
+
+def angle_diff(target, current):
+    """Smallest signed angle difference target - current in degrees (range -180..180)."""
+    d = (target - current + 180.0) % 360.0 - 180.0
+    return d
+
+def add_angles(a, b):
+    return (a + b) % 360.0
+
+# ===== AS5600 CLASS =====
+class AS5600:
+    def __init__(self, i2c, addr=AS5600_ADDR):
+        self.i2c = i2c
+        self.addr = addr
+
+    def read_raw(self):
+        # Angle registers: 0x0E (MSB), 0x0F (LSB) -> 12 bits
+        try:
+            data = self.i2c.readfrom_mem(self.addr, 0x0E, 2)
+            msb = data[0]
+            lsb = data[1]
+            raw = ((msb << 8) | lsb) & 0x0FFF
+            return raw
+        except OSError:
+            return None
+
+    def read_degrees(self):
+        raw = self.read_raw()
+        if raw is None:
+            return None
+        return (raw * 360.0) / 4096.0
+
+# ===== STEPPER CLASS =====
+class StepperULN2003:
+    # half-step sequence for ULN2003 driving typical unipolar 4-coil steppers
+    HALF_STEP_SEQ = [
+        (1,0,0,0),
+        (1,1,0,0),
+        (0,1,0,0),
+        (0,1,1,0),
+        (0,0,1,0),
+        (0,0,1,1),
+        (0,0,0,1),
+        (1,0,0,1),
+    ]
+
+    def __init__(self, pins, steps_per_rev=4096):
+        self.pins = [Pin(p, Pin.OUT) for p in pins]  # IN1..IN4
+        for p in self.pins:
+            p.value(0)
+        self.steps_per_rev = steps_per_rev
+        self._seq_len = len(self.HALF_STEP_SEQ)
+        self._pos = 0  # step index position (0..seq_len-1) internal, not absolute motor steps
+
+    def step(self, steps=1, direction=1, delay_ms=STEP_DELAY_MED):
+        # positive direction == forward (sequence index increases)
+        s = abs(steps)
+        for i in range(s):
+            self._pos = (self._pos + direction) % self._seq_len
+            self._set_pins(self.HALF_STEP_SEQ[self._pos])
+            time.sleep_ms(delay_ms)
+
+    def step_raw(self, steps=1, direction=1, delay_ms=STEP_DELAY_MED):
+        # same as step but no internal _pos wrapping logic difference (kept for clarity)
+        self.step(steps, direction, delay_ms)
+
+    def _set_pins(self, pattern):
+        for p, v in zip(self.pins, pattern):
+            p.value(v)
+
+    def stop(self):
+        # set pins low
+        for p in self.pins:
+            p.value(0)
+
+    @property
+    def degrees_per_step(self):
+        # one half-step is 360/(steps_per_rev * (full-step-factor)).
+        # For our convention with HALF_STEP_SEQ of length 8, steps_per_rev already takes that into account
+        return 360.0 / self.steps_per_rev
+
+    def steps_for_degrees(self, degrees):
+        # rounds to nearest step
+        steps = int(round(abs(degrees) / self.degrees_per_step))
+        return steps
+
+# ===== BUTTON HELPER =====
+class Button:
+    def __init__(self, pinno, pull=Pin.PULL_UP, active_low=True):
+        self.pin = Pin(pinno, Pin.IN, pull)
+        self.active_low = active_low
+        self._last = False
+        self._last_ms = 0
+
+    def is_pressed(self):
+        val = self.pin.value()
+        pressed = (val == 0) if self.active_low else (val == 1)
+        return pressed
+
+    def pressed_edge(self):
+        # returns True if a press edge occurred with debounce
+        now = time.ticks_ms()
+        p = self.is_pressed()
+        if p and not self._last:
+            # rising press
+            if time.ticks_diff(now, self._last_ms) > DEBOUNCE_MS:
+                self._last = True
+                self._last_ms = now
+                return True
+        if not p and self._last:
+            self._last = False
+            self._last_ms = now
+        return False
+
+    def wait_for_press(self, timeout_ms=None):
+        start = time.ticks_ms()
+        while True:
+            if self.is_pressed():
+                # simple debounce
+                time.sleep_ms(20)
+                if self.is_pressed():
+                    return True
+            if timeout_ms is not None and time.ticks_diff(time.ticks_ms(), start) > timeout_ms:
+                return False
+            time.sleep_ms(10)
+
+# ===== SETUP HARDWARE =====
+# Buttons
+buttons = {n: Button(pin) for n, pin in BTN_PINS.items()}
+
+# LEDs
+led1 = Pin(LED1_PIN, Pin.OUT)
+led2 = Pin(LED2_PIN, Pin.OUT)
+led1.value(0)
+led2.value(0)
+
+# I2C for two encoders
+i2c1 = I2C(0, scl=Pin(I2C1_SCL), sda=Pin(I2C1_SDA), freq=400000)  # encoder 1
+i2c2 = I2C(1, scl=Pin(I2C2_SCL), sda=Pin(I2C2_SDA), freq=400000)  # encoder 2
+
+encoder1 = AS5600(i2c1)
+encoder2 = AS5600(i2c2)
+
+# Steppers
+stepper1 = StepperULN2003(STEPPER1_PINS, steps_per_rev=STEPS_PER_REV_TILT)
+stepper2 = StepperULN2003(STEPPER2_PINS, steps_per_rev=STEPS_PER_REV_ROT)
+
+# ===== HIGH-LEVEL FUNCTIONS =====
+def read_encoder_deg(enc):
+    val = enc.read_degrees()
+    if val is None:
+        # device not responding; return 0 to avoid crashing. Caller should handle None ideally.
+        return None
+    return val
+
+def blink_led(led_pin, rate_ms):
+    # toggle once
+    led_pin.value(not led_pin.value())
+    time.sleep_ms(rate_ms)
+    led_pin.value(not led_pin.value())
+
+def wait_button2_press():
+    # wait until Button 2 pressed (confirm)
+    print("Waiting for Button 2 (confirm)...")
+    while True:
+        if buttons[2].pressed_edge():
+            time.sleep_ms(100)
+            return
+        time.sleep_ms(20)
+
+# ===== HOMING SEQUENCE FOR STEPPER 1 (TILT) =====
+def home_stepper1():
+    """
+    Implements the homing routine described:
+    - Stepper 1 is spinning slowly until user presses Button 7.
+    - On button 7 press we record encoder1 position (pressed_angle).
+    - We then move stepper 1 approximately TARGET_HOME_TILT (24 deg) in opposite direction to bring globe upright (0°).
+    - Use encoder feedback to get within 1 step of the target tilt.
+    """
+    print("Starting initial slow spin for stepper 1. Press Button 7 to mark home reference.")
+    # start continuous slow spin until button7 pressed
+    spinning = True
+    while True:
+        # step one small step
+        stepper1.step(1, direction=1, delay_ms=STEP_DELAY_SLOW)
+        if buttons[7].pressed_edge():
+            # user pressed home button
+            print("Button 7 pressed. Recording encoder1 and stopping spin.")
+            time.sleep_ms(50)
+            break
+
+    # read encoder
+    pressed_angle = read_encoder_deg(encoder1)
+    if pressed_angle is None:
+        print("Warning: Encoder 1 not responding. Home aborted.")
+        return False
+
+    print("Encoder1 angle at press: {:.3f}°".format(pressed_angle))
+    # The user said "The system now knows that the globe is tilted 24 degrees."
+    # We'll treat the press position as 'tilted 24 degrees' reference and move the globe back toward upright by ~24 degrees.
+    # Compute target encoder angle representing upright (home):
+    target_angle = add_angles(pressed_angle - TARGET_HOME_TILT, 0)  # pressed - 24 deg
+    # normalize
+    target_angle %= 360.0
+
+    print("Computed target encoder angle for upright/home: {:.3f}° (move ~{:.3f}°)".format(target_angle, TARGET_HOME_TILT))
+
+    # Two-stage approach: coarse move until near then compute precise steps
+    max_coarse_turn = TARGET_HOME_TILT - 0.5  # turn roughly to 23.5 deg as described
+    # Coarse target: pressed_angle - 23.5 deg
+    coarse_target = add_angles(pressed_angle - (TARGET_HOME_TILT - 0.5), 0)  # ~23.5
+    coarse_target %= 360.0
+
+    # Step direction determined by smallest angular path from current to coarse_target
+    def current_angle():
+        a = read_encoder_deg(encoder1)
+        if a is None:
+            return None
+        return a
+
+    # Move to coarse_target
+    cur = current_angle()
+    if cur is None:
+        print("Encoder1 read failed. Aborting homing.")
+        return False
+
+    angle_to_coarse = angle_diff(coarse_target, cur)
+    dir_sign = 1 if angle_to_coarse > 0 else -1
+    print("Coarse move: angle diff {:.3f}°, stepping direction {}".format(angle_to_coarse, dir_sign))
+
+    # Step in coarse loop
+    # Limit coarse steps to avoid runaway
+    coarse_limit_steps = stepper1.steps_for_degrees(abs(angle_to_coarse)) + stepper1.steps_for_degrees(5)  # some margin
+    steps_done = 0
+    while True:
+        cur = current_angle()
+        if cur is None:
+            print("Encoder1 read failed during coarse move.")
+            break
+        remaining = angle_diff(coarse_target, cur)
+        if abs(remaining) <= stepper1.degrees_per_step:
+            print("Reached coarse target (within 1 step).")
+            break
+        # step one step
+        stepper1.step(1, direction=1 if remaining > 0 else -1, delay_ms=STEP_DELAY_MED)
+        steps_done += 1
+        if steps_done > coarse_limit_steps:
+            print("Coarse step limit reached; breaking.")
+            break
+
+    # Now compute precise adjustment to get to exact target_angle (24 deg)
+    cur = current_angle()
+    if cur is None:
+        print("Encoder1 read failed before fine adjust.")
+        return False
+
+    rem = angle_diff(target_angle, cur)
+    steps_needed = stepper1.steps_for_degrees(rem)
+    print("Fine adjust: remaining {:.3f}°, steps_needed {}".format(rem, steps_needed))
+    # step in direction of rem sign
+    if steps_needed > 0:
+        stepper1.step(steps_needed, direction=1 if rem > 0 else -1, delay_ms=STEP_DELAY_MED)
+
+    # verify final
+    final = current_angle()
+    if final is None:
+        print("Encoder1 read failed at end of homing.")
+        return False
+    final_err = angle_diff(target_angle, final)
+    print("Final encoder angle {:.3f}°, error vs target {:.3f}°".format(final, final_err))
+    # Check within 1 step
+    if abs(final_err) <= stepper1.degrees_per_step + 1e-9:
+        print("Stepper 1 homed successfully.")
+        stepper1.stop()
+        return True
+    else:
+        print("Homing finished but error > 1 step. You may want to repeat or adjust constants.")
+        stepper1.stop()
+        return True  # still proceed; user can redo if needed
+
+# ===== INTERACTIVE GMT ALIGNMENT (STEPPER 2) =====
+def interactive_gmt_align():
+    """
+    Let user align prime meridian using buttons 3-6:
+    - Button 3: coarse + (large step)
+    - Button 4: coarse - (large step, here chosen as 30°)
+    - Button 5: fine + (hour step 15°)
+    - Button 6: fine - (5-minute step 1.25°)
+    Confirm with Button 2 when done.
+    """
+    print("GMT alignment: use buttons 3-6 to adjust longitude. Press Button 2 when done.")
+    # We'll show current encoder2 value and let user press buttons; each press moves stepper2.
+    # Map press -> movements (degrees)
+    large_deg = 30.0     # coarse
+    medium_deg = 15.0    # hour
+    small_deg = 1.25     # 5-min
+
+    # For convenience, map:
+    # Button3 -> +large, Button4 -> -large, Button5 -> +medium, Button6 -> -small (per earlier doc)
+    leds_blinking = True
+    last_blink = time.ticks_ms()
+    blink_period = LED_BLINK_FAST
+    led2.value(0)
+
+    while True:
+        # blink LED2 quickly to indicate this phase
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_blink) >= blink_period:
+            led2.value(not led2.value())
+            last_blink = now
+
+        if buttons[3].pressed_edge():
+            print("Button3 (coarse +) pressed")
+            step_deg = large_deg
+            steps = stepper2.steps_for_degrees(step_deg)
+            stepper2.step(steps, direction=1, delay_ms=STEP_DELAY_MED)
+        if buttons[4].pressed_edge():
+            print("Button4 (coarse -) pressed")
+            step_deg = large_deg
+            steps = stepper2.steps_for_degrees(step_deg)
+            stepper2.step(steps, direction=-1, delay_ms=STEP_DELAY_MED)
+        if buttons[5].pressed_edge():
+            print("Button5 (medium +) pressed")
+            step_deg = medium_deg
+            steps = stepper2.steps_for_degrees(step_deg)
+            stepper2.step(steps, direction=1, delay_ms=STEP_DELAY_MED)
+        if buttons[6].pressed_edge():
+            print("Button6 (small -) pressed")
+            step_deg = small_deg
+            steps = stepper2.steps_for_degrees(step_deg)
+            stepper2.step(steps, direction=-1, delay_ms=STEP_DELAY_MED)
+
+        if buttons[2].pressed_edge():
+            print("Button2 pressed -> GMT alignment finished.")
+            led2.value(1)  # stay on
+            return
+
+        time.sleep_ms(30)
+
+# ===== MONTH SELECTION (TILT) =====
+def month_to_tilt_deg(month):
+    """
+    Map month (1..12) to a tilt angle within +/- TILT_MAX.
+    We map month 1 -> +TILT_MAX (Jan), month 12 -> -TILT_MAX (Dec).
+    This is a simple linear mapping across months; adjust if you need orbital mapping.
+    """
+    m = clamp(month, 1, 12)
+    span = 2 * TILT_MAX
+    deg = TILT_MAX - (m - 1) * (span / 11.0)
+    return deg
+
+def interactive_month_selection():
+    """
+    After Jan1 alignment step, LED1 turns on and user uses Button3 to advance months.
+    Press Button2 to confirm.
+    """
+    print("Month selection mode. Press Button3 to advance month. Press Button2 when month is correct.")
+    current_month = 1
+    led1.value(1)
+    while True:
+        if buttons[3].pressed_edge():
+            current_month += 1
+            if current_month > 12:
+                current_month = 1
+            # move tilt to correspond to the new month
+            target_tilt = month_to_tilt_deg(current_month)
+            print("Selected month {} -> tilt {:.3f}°".format(current_month, target_tilt))
+            # Move stepper1 to target tilt (relative to current encoder1 reading)
+            # Read encoder
+            cur = read_encoder_deg(encoder1)
+            if cur is None:
+                print("Encoder1 read failed; cannot move to month tilt.")
+            else:
+                # We assume encoder angle maps to tilt degrees directly (0..360)
+                # We'll aim for a tilt angle expressed as small offset from current, so compute desired new encoder reading:
+                # Let's treat 0 degrees encoder reading as "upright home" location found earlier; user homed earlier.
+                # For simplicity we set target_encoder_angle to target_tilt normalized (may need adjustment in your setup)
+                target_encoder_angle = target_tilt % 360.0
+                rem = angle_diff(target_encoder_angle, cur)
+                steps = stepper1.steps_for_degrees(rem)
+                print("Stepping {} steps (rem {:.3f}°)".format(steps, rem))
+                if steps > 0:
+                    stepper1.step(steps, direction=1 if rem > 0 else -1, delay_ms=STEP_DELAY_MED)
+        if buttons[2].pressed_edge():
+            print("Month confirmed: {}".format(current_month))
+            led1.value(0)
+            return current_month
+        time.sleep_ms(30)
+
+# ===== TIME OF DAY SELECTION (STEPPER 2) =====
+def interactive_time_of_day_set():
+    """
+    Use buttons 4,5,6 to align the globe to the correct time.
+    - Button4: add 1 day (we implement as 360/365 deg ~ 0.986°)
+    - Button5: add 1 hour (15°)
+    - Button6: add 5 minutes (1.25°)
+    Confirm with Button2
+    """
+    print("Time-of-day alignment: use buttons 4 (day), 5 (hour), 6 (5min). Press Button2 when done.")
+    day_deg = 360.0 / 365.0
+    hour_deg = 15.0
+    five_min_deg = 360.0 / (24.0 * 12.0)  # 5 minutes = 1/12 hour -> 1.25 deg
+
+    led2_blink = True
+    last_blink = time.ticks_ms()
+    blink_period = LED_BLINK_FAST
+    led2.value(0)
+
+    while True:
+        now = time.ticks_ms()
+        if time.ticks_diff(now, last_blink) >= blink_period:
+            led2.value(not led2.value())
+            last_blink = now
+
+        if buttons[4].pressed_edge():
+            print("Button4 (day +) pressed")
+            steps = stepper2.steps_for_degrees(day_deg)
+            stepper2.step(steps, direction=1, delay_ms=STEP_DELAY_MED)
+        if buttons[5].pressed_edge():
+            print("Button5 (hour +) pressed")
+            steps = stepper2.steps_for_degrees(hour_deg)
+            stepper2.step(steps, direction=1, delay_ms=STEP_DELAY_MED)
+        if buttons[6].pressed_edge():
+            print("Button6 (5-min +) pressed")
+            steps = stepper2.steps_for_degrees(five_min_deg)
+            stepper2.step(steps, direction=1, delay_ms=STEP_DELAY_MED)
+
+        if buttons[2].pressed_edge():
+            print("Button2 pressed -> time-of-day set confirmed.")
+            led2.value(1)
+            return
+
+        time.sleep_ms(30)
+
+# ===== MAIN BOOT FLOW =====
+def boot_sequence():
+    # Step 1: initial spin, wait for button7 to home stepper1
+    print("Boot: starting initial spin / waiting for Button 7.")
+    homed1 = home_stepper1()
+    if not homed1:
+        print("Homing stepper1 failed or incomplete. Proceeding with caution.")
+
+    # Indicate ready for stepper2 homing: LED2 slow blink
+    print("Stepper 1 homed. LED2 slow blink: ready to home stepper 2 / set GMT.")
+    # blink LED2 slowly until user presses Button 2 to begin GMT alignment
+    last_blink = time.ticks_ms()
+    while True:
+        if time.ticks_diff(time.ticks_ms(), last_blink) >= LED_BLINK_SLOW:
+            led2.value(not led2.value())
+            last_blink = time.ticks_ms()
+        # If user presses Button 2, start GMT alignment
+        if buttons[2].pressed_edge():
+            led2.value(0)
+            break
+        time.sleep_ms(20)
+
+    # Now LED2 blink more rapidly and allow user to align GMT using buttons 3-6
+    interactive_gmt_align()
+
+    # After GMT alignment, press Button 2 to confirm. LED2 stays solid on.
+
+    # Now ready to set time. When user presses Button 2 again LED2 begins blinking slowly.
+    print("Ready to set time. Press Button 2 to begin time setting.")
+    # Wait for button 2 press to start time set mode
+    while True:
+        if buttons[2].pressed_edge():
+            print("Button 2 pressed -> starting time set.")
+            break
+        time.sleep_ms(20)
+
+    # Tilt globe to Jan 1 position: per your spec, globe will tilt 23.4 degrees (counterclockwise)
+    # We'll attempt to move stepper1 to target tilt 23.4 deg.
+    cur = read_encoder_deg(encoder1)
+    if cur is None:
+        print("Encoder1 read failed prior to Jan1 tilt move.")
+    else:
+        target_tilt_jan = 23.4 % 360.0
+        rem = angle_diff(target_tilt_jan, cur)
+        steps = stepper1.steps_for_degrees(rem)
+        print("Moving to Jan1 tilt {:.3f}° (rem {:.3f}°, steps {})".format(target_tilt_jan, rem, steps))
+        if steps > 0:
+            stepper1.step(steps, direction=1 if rem > 0 else -1, delay_ms=STEP_DELAY_MED)
+
+    # LED1 on signify ready to set month
+    selected_month = interactive_month_selection()
+
+    # After month confirmed, begin time-of-day alignment
+    print("Month set. Now time-of-day align. LED2 blinking quickly.")
+    led2.value(0)
+    interactive_time_of_day_set()
+
+    # After time set, normal operation begins
+    print("Setup complete. Entering normal operation.")
+    led2.value(1)  # on
+    # Normal operation: rotate with time (stub). Allow DST toggling with Button1.
+    dst_enabled = False
+    led1.value(1 if dst_enabled else 0)
+    last_tick = time.ticks_ms()
+
+    # We'll implement a simple placeholder: check for DST button, and do nothing else.
+    while True:
+        if buttons[1].pressed_edge():
+            dst_enabled = not dst_enabled
+            led1.value(1 if dst_enabled else 0)
+            print("DST toggled. Now:", "ON" if dst_enabled else "OFF")
+
+        # Here you could add code to increment stepper2 periodically to keep up with wall clock time.
+        # For now we sleep and poll buttons.
+        time.sleep_ms(100)
+
+# ===== MAIN =====
+if __name__ == "__main__":
+    try:
+        print("Astra Globe - boot sequence starting.")
+        boot_sequence()
+    except Exception as e:
+        print("Unhandled exception:", e)
+        # try to put steppers into safe state
+        stepper1.stop()
+        stepper2.stop()
+        led1.value(0)
+        led2.value(0)
